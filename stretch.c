@@ -11,9 +11,9 @@
 // Time Domain Harmonic Compression and Expansion
 //
 // This library performs time domain harmonic scaling with pitch detection
-// to stretch the timing of a 16-bit PCM signal (either mono or stereo) from
+// to stretch the timing of a PCM or IEEE Float signal (either mono or stereo) from
 // 1/2 to 2 times its original length. This is done without altering any of
-// the tonal characteristics.
+// its tonal characteristics.
 //
 // Use stereo (num_chans = 2), when both channels are from same source
 // and should contain approximately similar content.
@@ -32,29 +32,19 @@
 #define MIN_PERIOD  24          /* minimum allowable pitch period */
 #define MAX_PERIOD  2400        /* maximum allowable pitch period */
 
-#if INT_MAX == 32767
-#define MERGE_OFFSET    32768L      /* promote to long before offset */
-#define abs32           labs        /* use long abs to avoid UB */
-#else
-#define MERGE_OFFSET    32768
-#define abs32           abs
-#endif
-
-#define MAX_CORR    UINT32_MAX  /* maximum value for correlation ratios */
-
 struct stretch_cnxt {
     int num_chans, inbuff_samples, shortest, longest, tail, head, fast_mode;
-    int16_t *inbuff, *calcbuff;
+    float *inbuff, *calcbuff;
     float outsamples_error;
-    uint32_t *results;
+    float *results;
 
     struct stretch_cnxt *next;
-    int16_t *intermediate;
+    float *intermediate;
 };
 
-static void merge_blocks (int16_t *output, int16_t *input1, int16_t *input2, int samples);
-static int find_period_fast (struct stretch_cnxt *cnxt, int16_t *samples);
-static int find_period (struct stretch_cnxt *cnxt, int16_t *samples);
+static void merge_blocks_float (float *output, const float *input1, const float *input2, int samples);
+static int find_period_fast (struct stretch_cnxt *cnxt, const float *samples);
+static int find_period (struct stretch_cnxt *cnxt, const float *samples);
 
 /*
  * Initialize a context of the time stretching code. The shortest and longest periods
@@ -178,16 +168,18 @@ int stretch_output_capacity (StretchHandle handle, int max_num_samples, float ma
  * The exact number of samples output is not easy to determine in advance, so a function
  * is provided (stretch_output_capacity()) that calculates the maximum number of samples
  * that can be generated from a single call to this function (or stretch_flush()) given
- * a number of samples and maximum ratio. It is reccomended that that function be used
+ * a number of samples and maximum ratio. It is recommended that that function be used
  * after initialization to allocate in advance the buffer size required. Be sure to
  * multiply the return value by the number channels!
+ *
+ * Samples are expected to be normalized float32 values in the range [-1.0, 1.0].
  */
 
-int stretch_samples (StretchHandle handle, const int16_t *samples, int num_samples, int16_t *output, float ratio)
+int stretch_samples_float (StretchHandle handle, const float *samples, int num_samples, float *output, float ratio)
 {
     struct stretch_cnxt *cnxt = (struct stretch_cnxt *) handle;
     int out_samples = 0, next_samples = 0;
-    int16_t *outbuf = output;
+    float *outbuf = output;
     float next_ratio;
 
     /* if there's a cascaded instance after this one, try to do as much of the ratio here and the rest in "next" */
@@ -261,7 +253,7 @@ int stretch_samples (StretchHandle handle, const int16_t *samples, int num_sampl
                 process_ratio = ceil (ratio * 2.0) / 2.0;
 
             if (process_ratio == 0.5) {
-                merge_blocks (outbuf + out_samples, cnxt->inbuff + cnxt->tail,
+                merge_blocks_float (outbuf + out_samples, cnxt->inbuff + cnxt->tail,
                     cnxt->inbuff + cnxt->tail + period, period);
                 cnxt->outsamples_error += period - (period * 2.0 * ratio);
                 out_samples += period;
@@ -280,7 +272,7 @@ int stretch_samples (StretchHandle handle, const int16_t *samples, int num_sampl
             }
             else if (process_ratio == 1.5) {
                 memcpy (outbuf + out_samples, cnxt->inbuff + cnxt->tail, period * sizeof (cnxt->inbuff [0]));
-                merge_blocks (outbuf + out_samples + period, cnxt->inbuff + cnxt->tail + period,
+                merge_blocks_float (outbuf + out_samples + period, cnxt->inbuff + cnxt->tail + period,
                     cnxt->inbuff + cnxt->tail, period);
                 memcpy (outbuf + out_samples + period * 2, cnxt->inbuff + cnxt->tail + period, period * sizeof (cnxt->inbuff [0]));
                 cnxt->outsamples_error += (period * 3.0) - (period * 2.0 * ratio);
@@ -288,7 +280,7 @@ int stretch_samples (StretchHandle handle, const int16_t *samples, int num_sampl
                 cnxt->tail += period * 2;
             }
             else if (process_ratio == 2.0) {
-                merge_blocks (outbuf + out_samples, cnxt->inbuff + cnxt->tail,
+                merge_blocks_float (outbuf + out_samples, cnxt->inbuff + cnxt->tail,
                     cnxt->inbuff + cnxt->tail - period, period * 2);
 
                 cnxt->outsamples_error += (period * 2.0) - (period * ratio);
@@ -296,7 +288,7 @@ int stretch_samples (StretchHandle handle, const int16_t *samples, int num_sampl
                 cnxt->tail += period;
 
                 if (cnxt->fast_mode) {
-                    merge_blocks (outbuf + out_samples, cnxt->inbuff + cnxt->tail,
+                    merge_blocks_float (outbuf + out_samples, cnxt->inbuff + cnxt->tail,
                         cnxt->inbuff + cnxt->tail - period, period * 2);
 
                     cnxt->outsamples_error += (period * 2.0) - (period * ratio);
@@ -310,7 +302,7 @@ int stretch_samples (StretchHandle handle, const int16_t *samples, int num_sampl
             /* if there's another cascaded instance after this, pass the just stretched samples into that */
 
             if (cnxt->next) {
-                next_samples += stretch_samples (cnxt->next, outbuf, out_samples / cnxt->num_chans, output + next_samples * cnxt->num_chans, next_ratio);
+                next_samples += stretch_samples_float (cnxt->next, outbuf, out_samples / cnxt->num_chans, output + next_samples * cnxt->num_chans, next_ratio);
                 out_samples = 0;
             }
 
@@ -337,7 +329,7 @@ int stretch_samples (StretchHandle handle, const int16_t *samples, int num_sampl
         int samples_leftover = cnxt->head - cnxt->tail;
 
         if (cnxt->next)
-            next_samples += stretch_samples (cnxt->next, cnxt->inbuff + cnxt->tail, samples_leftover / cnxt->num_chans,
+            next_samples += stretch_samples_float (cnxt->next, cnxt->inbuff + cnxt->tail, samples_leftover / cnxt->num_chans,
                 output + next_samples * cnxt->num_chans, next_ratio);
         else {
             memcpy (outbuf + out_samples, cnxt->inbuff + cnxt->tail, samples_leftover * sizeof (*output));
@@ -349,7 +341,48 @@ int stretch_samples (StretchHandle handle, const int16_t *samples, int num_sampl
     }
 
     return cnxt->next ? next_samples : out_samples / cnxt->num_chans;
-}  
+}
+
+/*
+ * int16 compatibility wrapper for stretch_samples_float().
+ * Converts int16 samples to float, processes, and converts back.
+ */
+
+int stretch_samples (StretchHandle handle, const int16_t *samples, int num_samples, int16_t *output, float ratio)
+{
+    struct stretch_cnxt *cnxt = (struct stretch_cnxt *) handle;
+    int num_chans = cnxt->num_chans;
+    int total = num_samples * num_chans;
+    int i, result;
+    float *float_in, *float_out;
+    int max_out;
+
+    float_in = malloc (total * sizeof (float));
+    if (!float_in) return 0;
+
+    for (i = 0; i < total; i++)
+        float_in[i] = samples[i] * (1.0f / 32768.0f);
+
+    max_out = stretch_output_capacity (handle, num_samples, ratio);
+    float_out = malloc (max_out * num_chans * sizeof (float));
+    if (!float_out) {
+        free (float_in);
+        return 0;
+    }
+
+    result = stretch_samples_float (handle, float_in, num_samples, float_out, ratio);
+
+    for (i = 0; i < result * num_chans; i++) {
+        float v = float_out[i];
+        if (v > 1.0f) v = 1.0f;
+        if (v < -1.0f) v = -1.0f;
+        output[i] = (int16_t)(v * 32767.0f);
+    }
+
+    free (float_in);
+    free (float_out);
+    return result;
+}
 
 /*
  * Flush any leftover samples out at normal speed. For cascaded dual instances this must be called
@@ -358,7 +391,7 @@ int stretch_samples (StretchHandle handle, const int16_t *samples, int num_sampl
  * stretch_output_capacity().
  */
 
-int stretch_flush (StretchHandle handle, int16_t *output)
+int stretch_flush_float (StretchHandle handle, float *output)
 {
     struct stretch_cnxt *cnxt = (struct stretch_cnxt *) handle;
     int samples_leftover = cnxt->head - cnxt->tail;
@@ -366,10 +399,10 @@ int stretch_flush (StretchHandle handle, int16_t *output)
 
     if (cnxt->next) {
         if (samples_leftover)
-            samples_flushed = stretch_samples (cnxt->next, cnxt->inbuff + cnxt->tail, samples_leftover / cnxt->num_chans, output, 1.0);
+            samples_flushed = stretch_samples_float (cnxt->next, cnxt->inbuff + cnxt->tail, samples_leftover / cnxt->num_chans, output, 1.0);
 
         if (!samples_flushed)
-            samples_flushed = stretch_flush (cnxt->next, output);
+            samples_flushed = stretch_flush_float (cnxt->next, output);
     }
     else {
         memcpy (output, cnxt->inbuff + cnxt->tail, samples_leftover * sizeof (*output));
@@ -380,6 +413,33 @@ int stretch_flush (StretchHandle handle, int16_t *output)
     memset (cnxt->inbuff, 0, cnxt->tail * sizeof (*cnxt->inbuff));
 
     return samples_flushed;
+}
+
+/*
+ * int16 compatibility wrapper for stretch_flush_float().
+ */
+
+int stretch_flush (StretchHandle handle, int16_t *output)
+{
+    struct stretch_cnxt *cnxt = (struct stretch_cnxt *) handle;
+    int max_out = stretch_output_capacity (handle, cnxt->inbuff_samples / cnxt->num_chans, 1.0);
+    float *float_out;
+    int result, i;
+
+    float_out = malloc (max_out * cnxt->num_chans * sizeof (float));
+    if (!float_out) return 0;
+
+    result = stretch_flush_float (handle, float_out);
+
+    for (i = 0; i < result * cnxt->num_chans; i++) {
+        float v = float_out[i];
+        if (v > 1.0f) v = 1.0f;
+        if (v < -1.0f) v = -1.0f;
+        output[i] = (int16_t)(v * 32767.0f);
+    }
+
+    free (float_out);
+    return result;
 }
 
 /* free handle */
@@ -413,12 +473,14 @@ void stretch_deinit (StretchHandle handle)
  * that can directly compared regardless of the pitch period.  Second, the
  * numerator can be accumulated for successive periods, and only the
  * denominator need be completely recalculated.
+ *
+ * With float32 samples, no scaling or offset is required.
  */
 
-static int find_period (struct stretch_cnxt *cnxt, int16_t *samples)
+static int find_period (struct stretch_cnxt *cnxt, const float *samples)
 {
-    uint32_t sum, diff, factor, scaler, best_factor = 0;
-    int16_t *calcbuff = samples;
+    float sum, diff, best_factor = 0.0f;
+    float *calcbuff = (float *)samples;
     int period, best_period;
     int i, j;
 
@@ -429,46 +491,43 @@ static int find_period (struct stretch_cnxt *cnxt, int16_t *samples)
     if (cnxt->num_chans == 2) {
         calcbuff = cnxt->calcbuff;
 
-        for (sum = i = j = 0; i < cnxt->longest * 2; i += 2)
-            sum += abs32 (calcbuff [j++] = ((int32_t) samples [i] + samples [i+1]) >> 1);
+        for (sum = 0.0f, i = j = 0; i < cnxt->longest * 2; i += 2)
+            sum += fabsf (calcbuff [j++] = (samples [i] + samples [i+1]) * 0.5f);
     }
     else
-        for (sum = i = 0; i < cnxt->longest; ++i)
-            sum += abs32 (calcbuff [i]) + abs32 (calcbuff [i+cnxt->longest]);
+        for (sum = 0.0f, i = 0; i < cnxt->longest; ++i)
+            sum += fabsf (calcbuff [i]) + fabsf (calcbuff [i+cnxt->longest]);
 
-    // if silence return longest period, else calculate scaler based on largest sum
+    // if silence return longest period
 
-    if (sum)
-        scaler = (MAX_CORR - 1) / sum;
-    else
+    if (sum < 1e-12f)
         return cnxt->longest;
 
     /* accumulate sum for shortest period size */
 
-    for (sum = i = 0; i < period; ++i)
-        sum += abs32 (calcbuff [i]) + abs32 (calcbuff [i+period]);
+    for (sum = 0.0f, i = 0; i < period; ++i)
+        sum += fabsf (calcbuff [i]) + fabsf (calcbuff [i+period]);
 
     /* this loop actually cycles through all period lengths */
 
     while (1) {
-        int16_t *comp = calcbuff + period * 2;
-        int16_t *ref = calcbuff + period;
+        const float *comp = calcbuff + period * 2;
+        const float *ref = calcbuff + period;
 
         /* compute sum of absolute differences */
 
-        diff = 0;
+        diff = 0.0f;
 
         while (ref != calcbuff)
-            diff += abs32 ((int32_t) *--ref - *--comp);
+            diff += fabsf (*--ref - *--comp);
 
         /*
-         * Here we calculate and store the resulting correlation
-         * factor.  Note that we must watch for a difference of
-         * zero, meaning a perfect match.  Also, for increased
-         * precision using integer math, we scale the sum.
+         * Here we calculate the correlation factor.
+         * With float32, no scaling is needed — just divide directly.
+         * Guard against division by zero (perfect match).
          */
 
-        factor = diff ? (sum * scaler) / diff : MAX_CORR;
+        float factor = (diff > 1e-12f) ? (sum / diff) : 1e12f;
 
         if (factor >= best_factor) {
             best_factor = factor;
@@ -482,7 +541,7 @@ static int find_period (struct stretch_cnxt *cnxt, int16_t *samples)
 
         /* update accumulating sum and current period */
 
-        sum += abs32 (calcbuff [period * 2]) + abs32 (calcbuff [period * 2 + 1]);
+        sum += fabsf (calcbuff [period * 2]) + fabsf (calcbuff [period * 2 + 1]);
         period++;
     }
 
@@ -492,16 +551,16 @@ static int find_period (struct stretch_cnxt *cnxt, int16_t *samples)
 /*
  * This pitch detection function is similar to find_period() above, except that it
  * is optimized for speed. The audio data corresponding to two maximum periods is
- * averaged 2:1 into the calculation buffer, and then the calulations are done
+ * averaged 2:1 into the calculation buffer, and then the calculations are done
  * for every other period length. Because the time is essentially proportional to
  * both the number of samples and the number of period lengths to try, this scheme
  * can reduce the time by a factor approaching 4x. The correlation results on either
  * side of the peak are compared to calculate a more accurate center of the period.
  */
 
-static int find_period_fast (struct stretch_cnxt *cnxt, int16_t *samples)
+static int find_period_fast (struct stretch_cnxt *cnxt, const float *samples)
 {
-    uint32_t sum, diff, scaler, best_factor = 0;
+    float sum, diff, best_factor = 0.0f;
     int period, best_period;
     int i, j;
 
@@ -510,45 +569,43 @@ static int find_period_fast (struct stretch_cnxt *cnxt, int16_t *samples)
     /* first step is compressing data 2:1 into calcbuff, and calculating maximum sum */
 
     if (cnxt->num_chans == 2)
-        for (sum = i = j = 0; i < cnxt->longest * 2; i += 4)
-            sum += abs32 (cnxt->calcbuff [j++] = ((int32_t) samples [i] + samples [i+1] + samples [i+2] + samples [i+3]) >> 2);
+        for (sum = 0.0f, i = j = 0; i < cnxt->longest * 2; i += 4)
+            sum += fabsf (cnxt->calcbuff [j++] =
+                (samples [i] + samples [i+1] + samples [i+2] + samples [i+3]) * 0.25f);
     else
-        for (sum = i = j = 0; i < cnxt->longest * 2; i += 2)
-            sum += abs32 (cnxt->calcbuff [j++] = ((int32_t) samples [i] + samples [i+1]) >> 1);
+        for (sum = 0.0f, i = j = 0; i < cnxt->longest * 2; i += 2)
+            sum += fabsf (cnxt->calcbuff [j++] =
+                (samples [i] + samples [i+1]) * 0.5f);
 
-    // if silence return longest period, else calculate scaler based on largest sum
+    // if silence return longest period
 
-    if (sum)
-        scaler = (MAX_CORR - 1) / sum;
-    else
+    if (sum < 1e-12f)
         return cnxt->longest;
 
     /* accumulate sum for shortest period */
 
-    for (sum = i = 0; i < period; ++i)
-        sum += abs32 (cnxt->calcbuff [i]) + abs32 (cnxt->calcbuff [i+period]);
+    for (sum = 0.0f, i = 0; i < period; ++i)
+        sum += fabsf (cnxt->calcbuff [i]) + fabsf (cnxt->calcbuff [i+period]);
 
     /* this loop actually cycles through all period lengths */
 
     while (1) {
-        int16_t *comp = cnxt->calcbuff + period * 2;
-        int16_t *ref = cnxt->calcbuff + period;
+        const float *comp = cnxt->calcbuff + period * 2;
+        const float *ref = cnxt->calcbuff + period;
 
         /* compute sum of absolute differences */
 
-        diff = 0;
+        diff = 0.0f;
 
         while (ref != cnxt->calcbuff)
-            diff += abs32 ((int32_t) *--ref - *--comp);
+            diff += fabsf (*--ref - *--comp);
 
         /*
          * Here we calculate and store the resulting correlation
-         * factor.  Note that we must watch for a difference of
-         * zero, meaning a perfect match.  Also, for increased
-         * precision using integer math, we scale the sum.
+         * factor. With float32, no scaling is needed.
          */
 
-        cnxt->results [period] = diff ? (sum * scaler) / diff : MAX_CORR;
+        cnxt->results [period] = (diff > 1e-12f) ? (sum / diff) : 1e12f;
 
         if (cnxt->results [period] >= best_factor) {    /* check if best yet */
             best_factor = cnxt->results [period];
@@ -562,17 +619,17 @@ static int find_period_fast (struct stretch_cnxt *cnxt, int16_t *samples)
 
         /* update accumulating sum and current period */
 
-        sum += abs32 (cnxt->calcbuff [period * 2]) + abs32 (cnxt->calcbuff [period * 2 + 1]);
+        sum += fabsf (cnxt->calcbuff [period * 2]) + fabsf (cnxt->calcbuff [period * 2 + 1]);
         period++;
     }
 
     if (best_period * cnxt->num_chans * 2 != cnxt->shortest && best_period * cnxt->num_chans * 2 != cnxt->longest) {
-        uint32_t high_side_diff = cnxt->results [best_period] - cnxt->results [best_period+1];
-        uint32_t low_side_diff = cnxt->results [best_period] - cnxt->results [best_period-1];
+        float high_side_diff = cnxt->results [best_period] - cnxt->results [best_period+1];
+        float low_side_diff = cnxt->results [best_period] - cnxt->results [best_period-1];
 
-        if ((low_side_diff + 1) / 2 > high_side_diff)
+        if ((low_side_diff + 1.0f) / 2.0f > high_side_diff)
             best_period = best_period * 2 + 1;
-        else if ((high_side_diff + 1) / 2 > low_side_diff)
+        else if ((high_side_diff + 1.0f) / 2.0f > low_side_diff)
             best_period = best_period * 2 - 1;
         else
             best_period *= 2;
@@ -589,22 +646,19 @@ static int find_period_fast (struct stretch_cnxt *cnxt, int16_t *samples)
  * the first sample dominates, and at the end the second sample dominates.  In
  * this way the resulting block blends with the previous and next blocks.
  *
- * The signed values are offset to unsigned for the calculation and then offset
- * back to signed.  This is done to avoid the compression around zero that occurs
- * with calculations of this type on C implementations that round division toward
- * zero.
- *
- * The maximum period handled here without overflow possibility is 65535 samples.
- * This corresponds to a maximum calculated period of 16383 samples (2x for stereo
- * and 2x for the "2.0" version of the stretch algorithm). Since the maximum
- * calculated period is currently set for 2400 samples, we have plenty of margin.
+ * With float32 samples, this is a straightforward linear crossfade — no offset
+ * or integer rounding tricks are needed. The float arithmetic naturally handles
+ * the full dynamic range without compression around zero.
  */
 
-static void merge_blocks (int16_t *output, int16_t *input1, int16_t *input2, int samples)
+static void merge_blocks_float (float *output, const float *input1, const float *input2, int samples)
 {
     int i;
+    float inv_samples = 1.0f / (float)samples;
 
-    for (i = 0; i < samples; ++i)
-        output [i] = (int32_t)(((uint32_t)(input1 [i] + MERGE_OFFSET) * (samples - i) +
-            (uint32_t)(input2 [i] + MERGE_OFFSET) * i) / samples) - MERGE_OFFSET;
+    for (i = 0; i < samples; ++i) {
+        float w2 = (float)i * inv_samples;
+        float w1 = 1.0f - w2;
+        output[i] = input1[i] * w1 + input2[i] * w2;
+    }
 }

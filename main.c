@@ -71,10 +71,11 @@ typedef struct {
 } WaveHeader;
 
 #define WAVE_FORMAT_PCM         0x1
+#define WAVE_FORMAT_IEEE_FLOAT  0x3
 #define WAVE_FORMAT_EXTENSIBLE  0xfffe
 
-static int write_pcm_wav_header (FILE *outfile, uint32_t num_samples, int num_channels, int bytes_per_sample, uint32_t sample_rate);
-double rms_level_dB (int16_t *audio, int samples, int channels);
+static int write_wav_header (FILE *outfile, uint32_t num_samples, int num_channels, int bytes_per_sample, uint32_t sample_rate, int is_float);
+static double rms_level_dB (const float *audio, int samples, int channels);
 
 static int verbose_mode, quiet_mode;
 
@@ -86,6 +87,8 @@ int main (argc, argv) int argc; char **argv;
     int upper_frequency = 333, lower_frequency = 55;
     char *infilename = NULL, *outfilename = NULL;
     int audio_window_ms = AUDIO_WINDOW_MS;
+    int input_bytes_per_sample = 2;  /* detected from input; 2=int16, 4=float32 */
+    int input_is_float = 0;
     RiffChunkHeader riff_chunk_header;
     WaveHeader WaveHeader = { 0 };
     ChunkHeader chunk_header;
@@ -278,8 +281,24 @@ int main (argc, argv) int argc; char **argv;
             bits_per_sample = (chunk_header.ckSize == 40 && WaveHeader.Samples.ValidBitsPerSample) ?
                 WaveHeader.Samples.ValidBitsPerSample : WaveHeader.BitsPerSample;
 
-            if (bits_per_sample != 16) {
-                fprintf (stderr, "\"%s\" is not a 16-bit .WAV file!\n", infilename);
+            if (format == WAVE_FORMAT_IEEE_FLOAT ||
+                (format == WAVE_FORMAT_EXTENSIBLE && WaveHeader.SubFormat == WAVE_FORMAT_IEEE_FLOAT)) {
+                input_is_float = 1;
+                input_bytes_per_sample = 4;
+                if (bits_per_sample != 32) {
+                    fprintf (stderr, "\"%s\": float WAV must be 32-bit!\n", infilename);
+                    return 1;
+                }
+            }
+            else if (format == WAVE_FORMAT_PCM) {
+                input_bytes_per_sample = 2;
+                if (bits_per_sample != 16) {
+                    fprintf (stderr, "\"%s\": only 16-bit PCM is supported!\n", infilename);
+                    return 1;
+                }
+            }
+            else {
+                fprintf (stderr, "\"%s\": unsupported format (not PCM or IEEE Float)!\n", infilename);
                 return 1;
             }
 
@@ -288,19 +307,13 @@ int main (argc, argv) int argc; char **argv;
                 return 1;
             }
 
-            if (WaveHeader.BlockAlign != WaveHeader.NumChannels * 2) {
-                fprintf (stderr, "\"%s\" is not a valid .WAV file!\n", infilename);
+            if (WaveHeader.BlockAlign != WaveHeader.NumChannels * input_bytes_per_sample) {
+                fprintf (stderr, "\"%s\" has unexpected block alignment!\n", infilename);
                 return 1;
             }
 
-            if (format == WAVE_FORMAT_PCM) {
-                if (WaveHeader.SampleRate < 8000 || WaveHeader.SampleRate > 48000) {
-                    fprintf (stderr, "\"%s\" sample rate is %lu, must be 8000 to 48000!\n", infilename, (unsigned long) WaveHeader.SampleRate);
-                    return 1;
-                }
-            }
-            else {
-                fprintf (stderr, "\"%s\" is not a PCM .WAV file!\n", infilename);
+            if (WaveHeader.SampleRate < 8000 || WaveHeader.SampleRate > 48000) {
+                fprintf (stderr, "\"%s\" sample rate is %lu, must be 8000 to 48000!\n", infilename, (unsigned long) WaveHeader.SampleRate);
                 return 1;
             }
         }
@@ -392,7 +405,7 @@ int main (argc, argv) int argc; char **argv;
     }
 
     uint32_t scaled_rate = scale_rate ? (uint32_t)(WaveHeader.SampleRate * ratio + 0.5) : WaveHeader.SampleRate;
-    write_pcm_wav_header (outfile, 0, WaveHeader.NumChannels, 2, scaled_rate);
+    write_wav_header (outfile, 0, WaveHeader.NumChannels, input_bytes_per_sample, scaled_rate, input_is_float);
 
     if (cycle_ratio)
         max_ratio = (flags & STRETCH_DUAL_FLAG) ? 4.0 : 2.0;
@@ -400,8 +413,9 @@ int main (argc, argv) int argc; char **argv;
         max_ratio = silence_ratio;
 
     int max_expected_samples = stretch_output_capacity (stretcher, buffer_samples, max_ratio);
-    int16_t *inbuffer = malloc (buffer_samples * WaveHeader.BlockAlign), *prebuffer = NULL;
-    int16_t *outbuffer = malloc (max_expected_samples * WaveHeader.BlockAlign);
+    int float_frame_size = WaveHeader.NumChannels * (int)sizeof(float);
+    float *inbuffer = malloc (buffer_samples * float_frame_size), *prebuffer = NULL;
+    float *outbuffer = malloc (max_expected_samples * float_frame_size);
     int non_silence_frames = 0, silence_frames = 0, used_silence_frames = 0;
     int max_generated_stretch = 0, max_generated_flush = 0;
     int samples_to_stretch = 0, consecutive_silence_frames = 1;
@@ -409,7 +423,7 @@ int main (argc, argv) int argc; char **argv;
     /* in the gap/silence mode we need an additional buffer to scan the "next" buffer for level */
 
     if (silence_mode)
-        prebuffer = malloc (buffer_samples * WaveHeader.BlockAlign);
+        prebuffer = malloc (buffer_samples * float_frame_size);
 
     if (!inbuffer || !outbuffer || (silence_mode && !prebuffer)) {
         fprintf (stderr, "can't allocate required memory!\n");
@@ -420,8 +434,26 @@ int main (argc, argv) int argc; char **argv;
     /* read the entire file in frames and process with stretch */
 
     while (1) {
-        int samples_read = fread (silence_mode ? prebuffer : inbuffer, WaveHeader.BlockAlign,
-            samples_to_process >= buffer_samples ? buffer_samples : samples_to_process, infile);
+        int samples_to_read = samples_to_process >= buffer_samples ? buffer_samples : samples_to_process;
+        int samples_read = 0;
+
+        if (input_is_float) {
+            samples_read = fread (silence_mode ? prebuffer : inbuffer,
+                sizeof(float) * WaveHeader.NumChannels, samples_to_read, infile);
+        }
+        else {
+            int16_t *raw_buffer = malloc (samples_to_read * WaveHeader.BlockAlign);
+            if (!raw_buffer) {
+                fprintf (stderr, "can't allocate memory!\n");
+                fclose (infile);
+                return 1;
+            }
+            samples_read = fread (raw_buffer, WaveHeader.BlockAlign, samples_to_read, infile);
+            float *dest = silence_mode ? prebuffer : inbuffer;
+            for (int k = 0; k < samples_read * WaveHeader.NumChannels; k++)
+                dest[k] = raw_buffer[k] * (1.0f / 32768.0f);
+            free (raw_buffer);
+        }
 
         if (!silence_mode && !samples_read)
             break;
@@ -461,17 +493,35 @@ int main (argc, argv) int argc; char **argv;
             /* we use the gap/silence stretch ratio if the current frame, and the ones on either side, measure below the threshold */
 
             if (consecutive_silence_frames >= 3) {
-                samples_generated = stretch_samples (stretcher, inbuffer, samples_to_stretch, outbuffer, silence_ratio);
+                samples_generated = stretch_samples_float (stretcher, inbuffer, samples_to_stretch, outbuffer, silence_ratio);
                 used_silence_frames++;
             }
             else
-                samples_generated = stretch_samples (stretcher, inbuffer, samples_to_stretch, outbuffer, ratio);
+                samples_generated = stretch_samples_float (stretcher, inbuffer, samples_to_stretch, outbuffer, ratio);
 
             if (samples_generated) {
                 if (samples_generated > max_generated_stretch)
                     max_generated_stretch = samples_generated;
 
-                fwrite (outbuffer, WaveHeader.BlockAlign, samples_generated, outfile);
+                if (input_is_float) {
+                    fwrite (outbuffer, sizeof(float) * WaveHeader.NumChannels, samples_generated, outfile);
+                }
+                else {
+                    int16_t *raw_out = malloc (samples_generated * WaveHeader.BlockAlign);
+                    if (!raw_out) {
+                        fprintf (stderr, "can't allocate memory!\n");
+                        fclose (infile);
+                        return 1;
+                    }
+                    for (int k = 0; k < samples_generated * WaveHeader.NumChannels; k++) {
+                        float v = outbuffer[k];
+                        if (v > 1.0f) v = 1.0f;
+                        if (v < -1.0f) v = -1.0f;
+                        raw_out[k] = (int16_t)(v * 32767.0f);
+                    }
+                    fwrite (raw_out, WaveHeader.BlockAlign, samples_generated, outfile);
+                    free (raw_out);
+                }
                 outsamples += samples_generated;
 
                 if (samples_generated > max_expected_samples) {
@@ -484,7 +534,7 @@ int main (argc, argv) int argc; char **argv;
 
         if (silence_mode) {
             if (samples_read) {
-                memcpy (inbuffer, prebuffer, samples_read * WaveHeader.BlockAlign);
+                memcpy (inbuffer, prebuffer, samples_read * float_frame_size);
                 samples_to_stretch = samples_read;
             }
             else
@@ -495,7 +545,7 @@ int main (argc, argv) int argc; char **argv;
     /* next call the stretch flush function until it returns zero */
 
     while (1) {
-        int samples_flushed = stretch_flush (stretcher, outbuffer);
+        int samples_flushed = stretch_flush_float (stretcher, outbuffer);
 
         if (!samples_flushed)
             break;
@@ -503,7 +553,25 @@ int main (argc, argv) int argc; char **argv;
         if (samples_flushed > max_generated_flush)
             max_generated_flush = samples_flushed;
 
-        fwrite (outbuffer, WaveHeader.BlockAlign, samples_flushed, outfile);
+        if (input_is_float) {
+            fwrite (outbuffer, sizeof(float) * WaveHeader.NumChannels, samples_flushed, outfile);
+        }
+        else {
+            int16_t *raw_out = malloc (samples_flushed * WaveHeader.BlockAlign);
+            if (!raw_out) {
+                fprintf (stderr, "can't allocate memory!\n");
+                fclose (infile);
+                return 1;
+            }
+            for (int k = 0; k < samples_flushed * WaveHeader.NumChannels; k++) {
+                float v = outbuffer[k];
+                if (v > 1.0f) v = 1.0f;
+                if (v < -1.0f) v = -1.0f;
+                raw_out[k] = (int16_t)(v * 32767.0f);
+            }
+            fwrite (raw_out, WaveHeader.BlockAlign, samples_flushed, outfile);
+            free (raw_out);
+        }
         outsamples += samples_flushed;
 
         if (samples_flushed > max_expected_samples) {
@@ -521,7 +589,7 @@ int main (argc, argv) int argc; char **argv;
     fclose (infile);
 
     rewind (outfile);
-    write_pcm_wav_header (outfile, outsamples, WaveHeader.NumChannels, 2, scaled_rate);
+    write_wav_header (outfile, outsamples, WaveHeader.NumChannels, input_bytes_per_sample, scaled_rate, input_is_float);
     fclose (outfile);
 
     if (insamples && verbose_mode) {
@@ -543,7 +611,7 @@ int main (argc, argv) int argc; char **argv;
     return 0;
 }
 
-static int write_pcm_wav_header (FILE *outfile, uint32_t num_samples, int num_channels, int bytes_per_sample, uint32_t sample_rate)
+static int write_wav_header (FILE *outfile, uint32_t num_samples, int num_channels, int bytes_per_sample, uint32_t sample_rate, int is_float)
 {
     RiffChunkHeader riffhdr;
     ChunkHeader datahdr, fmthdr;
@@ -554,7 +622,7 @@ static int write_pcm_wav_header (FILE *outfile, uint32_t num_samples, int num_ch
 
     memset (&wavhdr, 0, sizeof (wavhdr));
 
-    wavhdr.FormatTag = WAVE_FORMAT_PCM;
+    wavhdr.FormatTag = is_float ? WAVE_FORMAT_IEEE_FLOAT : WAVE_FORMAT_PCM;
     wavhdr.NumChannels = num_channels;
     wavhdr.SampleRate = sample_rate;
     wavhdr.BytesPerSecond = sample_rate * num_channels * bytes_per_sample;
@@ -576,7 +644,7 @@ static int write_pcm_wav_header (FILE *outfile, uint32_t num_samples, int num_ch
         fwrite (&datahdr, sizeof (datahdr), 1, outfile);
 }
 
-double rms_level_dB (int16_t *audio, int samples, int channels)
+static double rms_level_dB (const float *audio, int samples, int channels)
 {
     double rms_sum = 0.0;
     int i;
@@ -586,9 +654,10 @@ double rms_level_dB (int16_t *audio, int samples, int channels)
             rms_sum += (double) audio [i] * audio [i];
     else
         for (i = 0; i < samples; ++i) {
-            double average = (audio [i * 2] + audio [i * 2 + 1]) / 2.0;
+            double average = ((double) audio [i * 2] + audio [i * 2 + 1]) / 2.0;
             rms_sum += average * average;
         }
 
-    return log10 (rms_sum / samples / (32768.0 * 32767.0 * 0.5)) * 10.0;
+    /* float32 samples are in [-1.0, 1.0]; 0.5 accounts for RMS of sine at full scale */
+    return log10 (rms_sum / samples / 0.5) * 10.0;
 }

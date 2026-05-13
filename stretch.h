@@ -11,7 +11,7 @@
 // Time Domain Harmonic Compression and Expansion
 //
 // This library performs time domain harmonic scaling with pitch detection
-// to stretch the timing of a 16-bit PCM signal (either mono or stereo) from
+// to stretch the timing of a PCM or IEEE Float signal (either mono or stereo) from
 // 1/2 to 2 times its original length. This is done without altering any of
 // its tonal characteristics.
 //
@@ -36,8 +36,15 @@ typedef void *StretchHandle;
 
 StretchHandle stretch_init (int shortest_period, int longest_period, int num_chans, int flags);
 int stretch_output_capacity (StretchHandle handle, int max_num_samples, float max_ratio);
+
+// Original int16 API (maintained for backward compatibility)
 int stretch_samples (StretchHandle handle, const int16_t *samples, int num_samples, int16_t *output, float ratio);
 int stretch_flush (StretchHandle handle, int16_t *output);
+
+// New float32 API (preferred for new code)
+int stretch_samples_float (StretchHandle handle, const float *samples, int num_samples, float *output, float ratio);
+int stretch_flush_float (StretchHandle handle, float *output);
+
 void stretch_reset (StretchHandle handle);
 void stretch_deinit (StretchHandle handle);
 
